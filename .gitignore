@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# runs and logs (output/train, output/eval: checkpoints, videos, metrics; outputs: Hydra)
+output/
+outputs/
+
+# OGBench datasets and cached latent datasets (data_dir in config.yaml)
+datasets/data/

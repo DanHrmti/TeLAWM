@@ -1,0 +1,326 @@
+defaults:
+    - override hydra/launcher: submitit_local
+
+# code optimization
+compile: true
+cudagraphs: true
+buffer_lazy_gather: auto  # [auto, true, false] - auto: on for obs=rgb (gather only the addressed frames instead of full episodes)
+
+# logging
+wandb_project: TeLAWM
+wandb_entity: null  # W&B entity (null: your default entity)
+wandb_silent: false
+wandb_name_suffix: ""
+run_suffix: ""  # if non-empty, appended to log_dir/eval_log_dir: <agent>_<task>_<seed>_<run_suffix>
+enable_wandb: true
+save_video: true
+save_agent: true
+seed: random
+
+# environment
+task: antmaze-medium-navigate-v0
+obs: state  # [state, rgb, latent]
+             #   latent: visual-* frames encoded by a frozen image autoencoder (latent_encoder_checkpoint)
+latent_encoder_checkpoint:  # path (relative to the repo root) to an autoencoder checkpoint (trained with agent=ae)
+reward: env  # [unsupervised, env] - refers to reward returned from the buffer, unsupervised corresponds to the ogbench reward
+done_signal: true
+gamma: 0.99
+
+# evaluation
+eval_checkpoint: output/train/path/to/file.pt
+eval_variant_name: ""
+eval_freq: 100_000  # during training
+num_eval_episodes: 20
+num_video_episodes: 1
+video_frame_skip: 3
+eval_task_ids: [1, 2, 3, 4, 5]  # for ogbench tasks
+render_subgoal_candidates: false
+
+# training
+steps: 1_000_000
+batch_size: 1024  # [states: 1024, pixels: 256]
+lr: 0.0003
+grad_clip_norm: 20
+# goal sampling
+# ogbench defaults: (0.2, 0.5, 0.3, true), (0.0, 1.0, 0.0, false)
+p_curgoal_value: 0.2
+p_trajgoal_value: 0.5
+p_randgoal_value: 0.3
+geom_sample_value: true
+p_curgoal_policy: 0.0
+p_trajgoal_policy: 1.0
+p_randgoal_policy: 0.0
+geom_sample_policy: false
+
+# agent
+agent: iql  # [iql, tdmpc, saw, hiql, sd, telawm, acwm, lacwm, ae]
+train_from_checkpoint: false
+checkpoint: output/train/path/to/file.pt
+
+# architecture
+arch_mlp:  # standard
+  h_dim: 512
+  conv_channels: [16, 32, 32]  # for 'rgb' obs_mode
+
+# representation learning
+ae:  # image autoencoder with a goal-conditioned reward head on the latent (agent: ae, requires obs=rgb, reward=env)
+  z_dim: 32                    # latent dimension: the observation dimension of obs=latent agents
+  conv_channels: [32, 64, 64]  # Impala stacks of the encoder; each halves the spatial resolution
+  h_dim: 512                   # width of the encoder/decoder MLP layers between the conv trunk and the latent
+  reward_h_dim: 512            # goal-reached classifier r(z, z_g) width
+  reward_n_layers: 2
+  reward_weight: 1.0           # weight of the classifier BCE relative to the pixel reconstruction MSE
+  l2_weight: 0.001             # penalty on |z|^2, to keep the latent scale bounded
+  kl_weight: 0.0               # > 0 turns the encoder into a Gaussian VAE posterior (0 = deterministic autoencoder)
+  recon_every: 10_000          # steps between reconstruction grids written to <log_dir>/recon (0 disables)
+
+# rl agents
+iql:
+  pretrained_vf: false
+  vf_chkpt: output/train/path/to/file.pt
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  n_step: 1  # TD n-step return for Q targets; 1 = current behavior
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  subgoal_k: 100  # training
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+
+tdmpc:
+  pretrained_vf: false
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: false
+  policy_chkpt: output/train/path/to/file.pt
+  # planning (MPPI)
+  horizon_plan: 25
+  iterations: 6
+  num_samples: 512
+  num_pi_trajs: 512
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+  num_elites: 64
+  temperature: 0.5
+  min_std: 0.05
+  max_std: 2
+  planning_score: last  # [best, last, all] - how to score planned trajectories
+  plan_execute_steps: 1  # planned actions to execute before replanning (1 <= value <= horizon_plan)
+  # iql
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  policy_type: deterministic  # [noisy, deterministic]
+
+saw:
+  pretrained_vf: true
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: true
+  policy_chkpt: output/train/path/to/file.pt
+  alpha: 3.0  # tune per env+rep
+  beta: 3.0  # tune per env+rep
+  subgoal_k: 25  # training
+  # iql
+  tau: 0.005
+  expectile: 0.7
+  pi_extract_type: awr # [ddpgbc, awr], high-level policy (goal pi) is always extracted using awr
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+
+hiql:
+  pretrained_vf: false
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: true
+  policy_chkpt: output/train/path/to/file.pt
+  beta: 3.0  # tune per env+rep
+  subgoal_k: 50  # training
+  subgoal_steps: 25  # test-time
+  subgoal_reached_threshold: 10  # |V(obs, subgoal)| below this triggers replan (same semantics as telawm)
+  goal_vicinity_threshold: 30  # |V(obs, goal)| below this: use full goal as subgoal
+  disable_subgoal: false  # test-time
+  debug_subgoals: false  # if true, prints value of current obs to goal and subgoal to goal
+  # iql
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+  
+sd:
+  pretrained_vf: true
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: true
+  policy_chkpt: output/train/path/to/file.pt
+  n_diffusion_steps: 100
+  ddim_sampling_steps: 20 # set to null/omit for full DDPM
+  ddim_eta: 0.0 # 0=deterministic DDIM, 1.0=DDPM-equivalent noise
+  sampling_temperature: 1.0  # < 1 sharpens, > 1 broadens; only matters with eta > 0
+  clip_denoised: false
+  predict_epsilon: true
+  beta_schedule: cosine # [cosine, linear]
+  goal_conditioned: false
+  n_sg_samples: 128
+  subgoal_steps: 10
+  goal_vicinity_threshold: 30
+  subgoal_reached_threshold: 10
+  disable_subgoal: false
+  debug_subgoals: false
+  # iql
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  subgoal_k: 100  # training
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+
+# latent action model (for TeLAWM)
+telawm:
+  pretrained_vf: false
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: false
+  policy_chkpt: output/train/path/to/file.pt
+  lam_timescale: 50  # k: the LAM learns (s_t, s_{t+k}) -> z and (s, z) -> s'
+  subgoal_steps: 10  # test-time replan interval
+  planning_steps: 2  # test-time
+  n_sg_samples: 128  # test-time
+  subgoal_reached_threshold: 10  # absolute difference value |V(obs,subgoal)| below which subgoal is considered reached for replanning purposes
+  goal_vicinity_threshold: 30  # absolute value |V(obs,goal)| below which subgoal is set to overall goal
+  planning_score: last  # [best, last, all] - how to score planned trajectories
+  subgoal_state: final  # [final, first] - which state in the best trajectory to use as the subgoal
+  latent_action_repeat: false  # if true, sample LAM latent once and reuse for full rollout horizon
+  filter_subgoals: false  # test-time
+  debug_subgoals: false  # if true, prints value of current obs to goal and subgoal to goal
+  disable_subgoal: false  # whether to disable subgoal sampling and just use the goal as the subgoal
+  # lam
+  h_dim: 512               # MLP hidden dim
+  beta_kl: 0.004           # KL regularizer weight
+  learned_prior: true      # learn p(z|s) and use regularizer/likelihood on z
+  latent_dim: 8            # latent action dimension
+  # iql
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  subgoal_k: 100  # training
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+
+acwm:
+  pretrained_vf: true
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: true
+  policy_chkpt: output/train/path/to/file.pt
+  wm_timescale: 50  # T: action chunk length; the WM learns (s_t, a_{t:t+T-1}) -> s_{t+T}
+  subgoal_steps: 10  # test-time replan interval
+  planning_steps: 2  # test-time
+  n_sg_samples: 128  # test-time
+  subgoal_reached_threshold: 10  # absolute difference value |V(obs,subgoal)| below which subgoal is considered reached for replanning purposes
+  goal_vicinity_threshold: 30  # absolute value |V(obs,goal)| below which subgoal is set to overall goal
+  planning_score: last  # [best, last, all] - how to score planned trajectories
+  subgoal_state: final # [final, first] - which state in the best trajectory to use as the subgoal
+  action_chunk_repeat: false  # if true, sample LAM latent once and reuse for full rollout horizon
+  filter_subgoals: false  # test-time
+  debug_subgoals: false  # if true, prints value of current obs to goal and subgoal to goal
+  disable_subgoal: false  # whether to disable subgoal sampling and just use the goal as the subgoal
+  # diffusion policy bc
+  n_diffusion_steps: 20
+  ddim_sampling_steps: 20 # set to null/omit for full DDPM
+  ddim_eta: 0.0 # 0=deterministic DDIM, 1.0=DDPM-equivalent noise
+  sampling_temperature: 1.0  # < 1 sharpens, > 1 broadens; only matters with eta > 0
+  clip_denoised: true
+  predict_epsilon: true
+  beta_schedule: cosine # or linear
+  snr_gamma: 5.0
+  clip_denoised_range: [-1.0, 1.0]
+  # iql
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  subgoal_k: 100  # training
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+
+lacwm:
+  pretrained_vf: true
+  vf_chkpt: output/train/path/to/file.pt
+  pretrained_policy: true
+  policy_chkpt: output/train/path/to/file.pt
+  pretrained_lacm: false # set true to load a pre-trained VAE/CVAE and freeze it
+  lacm_chkpt: output/train/path/to/file.pt # an lacwm checkpoint (its "lacm" entry is loaded)
+  # World-model / planning
+  wm_timescale: 50  # T: action chunk length (primitive steps) of the LACM and WM
+  subgoal_steps: 10  # test-time replan interval
+  planning_steps: 2 # number of WM rollout steps per plan
+  n_sg_samples: 128 # number of parallel trajectories to sample
+  planning_score: last # [best, last, all] — how to score trajectories
+  subgoal_state: final # [final, first] - which state in the best trajectory to use as the subgoal
+  latent_action_repeat: false # if true, sample z once and reuse for full horizon
+  # NOTE: referred to as latent_action_repeat inside
+  # the agent (inherits TeLAWM flag semantics)
+  subgoal_reached_threshold: 10 # |V(obs, subgoal)| below which subgoal is reached
+  goal_vicinity_threshold: 30 # |V(obs, goal)| below which subgoal = goal
+  filter_subgoals: false
+  debug_subgoals: false
+  disable_subgoal: false
+  # Latent action-chunk VAE/CVAE
+  state_conditioned: true # false → VAE over a_chunk; true → CVAE with s_t
+  variant: dynamics # [dynamics, chunk_vae] dynamics: the LACM decoder predicts s_{t+T} from (s_t, z) and is the planning model;
+                    #   chunk_vae: the LACM reconstructs the action chunk (standard (C)VAE) and a separate WM on z is the planning model
+  # NOTE: learned_prior requires state_conditioned=true
+  h_dim: 512 # MLP hidden dim (encoder, decoder, prior)
+  beta_kl: 0.004 # KL regulariser weight
+  learned_prior: false # learn p(z|s) for KL reg + planning samples
+  # requires state_conditioned=true
+  latent_dim: 8 # latent dimension of the VAE
+  # iql
+  tau: 0.005
+  alpha: 0.1  # tune per env+rep
+  expectile: 0.7
+  pi_extract_type: ddpgbc  # [ddpgbc, awr]
+  pi_subgoal: false  # if true, uses policy_subgoal instead of policy_goal for low-level policy
+  subgoal_k: 100  # training
+  policy_type: deterministic  # [noisy, deterministic]
+  pi_noise: 0.2
+  pi_noise_clip: 0.5
+
+# data
+data_dir: datasets/data
+
+# convenience
+work_dir: ???
+log_dir: ???
+eval_log_dir: ???
+task_title: ???
+exp_name: ???
+obs_shape: ???
+action_dim: ???
+action_high: ???
+action_low: ???
+data_episode_length: ???
+env_episode_length: ???
+
+# common agent params
+vf_chkpt: ???
+policy_chkpt: ???
+tau: ???
+alpha: ???
+expectile: ???
+pi_extract_type: ???
+pi_subgoal: ???
+subgoal_k: ???
+subgoal_steps: ???
